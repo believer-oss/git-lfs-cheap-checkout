@@ -83,24 +83,6 @@ fn path_from_oid(mut base_path: PathBuf, oid: &Oid) -> PathBuf {
     base_path
 }
 
-// Provide additional troubleshooting info on failure to read pointer
-async fn identify_pointer(e: std::io::Error, file: &str) {
-    let meta = tokio::fs::metadata(file).await;
-    match meta {
-        Ok(meta) => {
-            if meta.len() > 1024 {
-                eprintln!("{}: file too large, already smudged?", file);
-                return;
-            }
-        }
-        Err(_) => {
-            eprintln!("{}: could not get metadata", file);
-            return;
-        }
-    }
-    eprintln!("{}: {}", file, e);
-}
-
 fn cli() -> Command {
     Command::new("git-lfs-cheap-checkout")
         .about("Smudge git-lfs files with hard links")
@@ -164,13 +146,24 @@ async fn main() {
             .expect("could not convert to utf8 from pointer")
             .to_string();
         handles.spawn(async move {
+            // Pointer files must be < 1024. If the file is larger, don't bother reading it - we
+            // assume it's already been smudged to match upstream behavior.
+            // https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md
+            let meta = tokio::fs::metadata(&local_file)
+                .await
+                .expect("failed to get metadata for pointer file");
+            if meta.len() > 1024 {
+                return;
+            }
+
             let contents = tokio::fs::read_to_string(&local_file).await;
 
+            // We only care if the pointer hasn't been smudged already
             let pointer = match contents {
                 Ok(contents) => parse_pointer(&contents).expect("failed to parse pointer"),
                 Err(e) => {
-                    identify_pointer(e, &local_file).await;
-                    exit(1);
+                    eprintln!("{}: {}", local_file, e);
+                    return;
                 }
             };
 
@@ -179,16 +172,18 @@ async fn main() {
             }
 
             let obj = path_from_oid(local_object_dir, &pointer.oid);
-            if !dry_run {
-                if verify_size {
-                    let meta = tokio::fs::metadata(&obj)
-                        .await
-                        .expect("failed to get metadata");
-                    if meta.len() != pointer.size {
-                        eprintln!("{}: size mismatch", local_file);
-                        exit(1);
-                    }
+
+            if verify_size {
+                let meta = tokio::fs::metadata(&obj)
+                    .await
+                    .expect("failed to get metadata");
+                if meta.len() != pointer.size {
+                    eprintln!("{}: size mismatch", local_file);
+                    exit(1);
                 }
+            }
+
+            if !dry_run {
                 tokio::fs::remove_file(&local_file)
                     .await
                     .expect("failed to remove file");
