@@ -85,8 +85,8 @@ fn path_from_oid(mut base_path: PathBuf, oid: &Oid) -> PathBuf {
 }
 
 // Provide additional troubleshooting info on failure to read pointer
-fn identify_pointer(e: std::io::Error, file: &str) {
-    let meta = std::fs::metadata(file);
+async fn identify_pointer(e: std::io::Error, file: &str) {
+    let meta = tokio::fs::metadata(file).await;
     match meta {
         Ok(meta) => {
             if meta.len() > 1024 {
@@ -115,7 +115,8 @@ fn cli() -> Command {
         )
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let matches = cli().get_matches();
     let dry_run = matches.get_flag("dry_run");
     let verbose = matches.get_flag("verbose");
@@ -154,38 +155,51 @@ fn main() {
         .output()
         .expect("failed to execute git-lfs ls-files");
 
+    let mut handles = tokio::task::JoinSet::new();
     for file in files.stdout.split(|&c| c == b'\n') {
         if file.is_empty() {
             continue;
         }
-        let file = std::str::from_utf8(file).expect("could not convert to utf8 from pointer");
-        let contents = std::fs::read_to_string(file);
+        let local_object_dir = object_dir.clone();
+        let local_file = std::str::from_utf8(file)
+            .expect("could not convert to utf8 from pointer")
+            .to_string();
+        handles.spawn(async move {
+            let contents = tokio::fs::read_to_string(&local_file).await;
 
-        let pointer = match contents {
-            Ok(contents) => parse_pointer(&contents).expect("failed to parse pointer"),
-            Err(e) => {
-                identify_pointer(e, file);
-                exit(1);
-            }
-        };
-
-        if verbose {
-            println!("{}: {:?}", file, pointer);
-        }
-
-        let obj = path_from_oid(object_dir.clone(), &pointer.oid);
-        if !dry_run {
-            if verify_size {
-                let meta = std::fs::metadata(&obj).expect("failed to get metadata");
-                if meta.len() != pointer.size {
-                    eprintln!("{}: size mismatch", file);
-                    continue;
+            let pointer = match contents {
+                Ok(contents) => parse_pointer(&contents).expect("failed to parse pointer"),
+                Err(e) => {
+                    identify_pointer(e, &local_file).await;
+                    exit(1);
                 }
+            };
+
+            if verbose {
+                println!("{}: {:?}", &local_file, pointer);
             }
-            std::fs::remove_file(file).expect("failed to remove file");
-            std::fs::hard_link(obj, file).expect("failed to hard link");
-        }
+
+            let obj = path_from_oid(local_object_dir, &pointer.oid);
+            if !dry_run {
+                if verify_size {
+                    let meta = tokio::fs::metadata(&obj)
+                        .await
+                        .expect("failed to get metadata");
+                    if meta.len() != pointer.size {
+                        eprintln!("{}: size mismatch", local_file);
+                        exit(1);
+                    }
+                }
+                tokio::fs::remove_file(&local_file)
+                    .await
+                    .expect("failed to remove file");
+                tokio::fs::hard_link(obj, local_file)
+                    .await
+                    .expect("failed to hard link");
+            }
+        });
     }
+    handles.join_all().await;
 }
 
 #[cfg(test)]
