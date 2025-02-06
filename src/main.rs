@@ -22,7 +22,6 @@ struct Oid(String);
 
 impl From<&str> for Oid {
     fn from(s: &str) -> Self {
-        println!("s: {}", s);
         let sha256 = s.split(':').nth(1).expect("could not find :").to_string();
         Oid(sha256)
     }
