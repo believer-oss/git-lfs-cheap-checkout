@@ -103,20 +103,24 @@ async fn main() {
     let verbose = matches.get_flag("verbose");
     let verify_size = matches.get_flag("verify_size");
 
+    // Move to a git repo, if we're called outside of it with an arg
     if let Some(workdir) = matches.get_one::<PathBuf>("workdir") {
         std::env::set_current_dir(workdir).expect("failed to set workdir");
     }
 
-    // Get the git-lfs env
+    // Get the LFS storage directory and repo root from git-lfs env
     let env = std::process::Command::new("git-lfs")
         .arg("env")
         .output()
         .expect("failed to execute git-lfs env");
 
+    // This is the LFS storage dir, which contains the LFS objects named by their hash/OID.
+    // ex. <object_dir>/ff/01/ff01f714b73af49cfa2a5837e08f36559a8b1af37928351f7e750204d632bfc0
     let mut object_dir = PathBuf::new();
 
     for line in env.stdout.split(|&c| c == b'\n') {
         let line = std::str::from_utf8(line).expect("could not convert to utf8 from env");
+        // Workdir is the root of the git repo
         if line.starts_with("LocalWorkingDir") {
             let workdir = line
                 .split("=")
@@ -124,6 +128,7 @@ async fn main() {
                 .expect("could not extract value from env");
             std::env::set_current_dir(workdir).expect("failed to set workdir");
         }
+        // Mediadir is the LFS storage dir
         if line.starts_with("LocalMediaDir") {
             object_dir.push(line.split("=").nth(1).expect("failed to get object dir"));
         }
@@ -136,15 +141,18 @@ async fn main() {
         .output()
         .expect("failed to execute git-lfs ls-files");
 
+    // Loop through the files and smudge them if necessary
     let mut handles = tokio::task::JoinSet::new();
     for file in files.stdout.split(|&c| c == b'\n') {
         if file.is_empty() {
             continue;
         }
+
         let local_object_dir = object_dir.clone();
         let local_file = std::str::from_utf8(file)
             .expect("could not convert to utf8 from pointer")
             .to_string();
+
         handles.spawn(async move {
             // Pointer files must be < 1024. If the file is larger, don't bother reading it - we
             // assume it's already been smudged to match upstream behavior.
@@ -173,6 +181,7 @@ async fn main() {
 
             let obj = path_from_oid(local_object_dir, &pointer.oid);
 
+            // Ensure that the object size matches what the pointer file says
             if verify_size {
                 let meta = tokio::fs::metadata(&obj)
                     .await
@@ -183,6 +192,7 @@ async fn main() {
                 }
             }
 
+            // If we're not in a dry run, remove the pointer and hard link the object
             if !dry_run {
                 tokio::fs::remove_file(&local_file)
                     .await
