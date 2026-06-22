@@ -121,9 +121,7 @@ async fn main() {
             .expect("failed to enumerate cache directory");
         for (cache_path, oid) in objects {
             let expected = expected.clone();
-            handles.spawn(
-                async move { audit_object(cache_path, oid, expected, opts).await },
-            );
+            handles.spawn(async move { audit_object(cache_path, oid, expected, opts).await });
         }
     } else {
         // Get list of files from ls-files
@@ -142,9 +140,9 @@ async fn main() {
                 .expect("could not convert to utf8 from pointer")
                 .to_string();
             let expected = expected.clone();
-            handles.spawn(
-                async move { smudge_file(local_file, local_object_dir, expected, opts).await },
-            );
+            handles.spawn(async move {
+                smudge_file(local_file, local_object_dir, expected, opts).await
+            });
         }
     }
 

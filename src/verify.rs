@@ -83,11 +83,7 @@ enum UsnResult {
     Failure(String),
 }
 
-async fn usn_with_hash_fallback(
-    cache_path: &Path,
-    oid: &Oid,
-    expected: Option<i64>,
-) -> UsnResult {
+async fn usn_with_hash_fallback(cache_path: &Path, oid: &Oid, expected: Option<i64>) -> UsnResult {
     let usn = match read_usn(cache_path).await {
         Ok(u) => u,
         Err(e) => {
@@ -144,7 +140,10 @@ async fn report_failure(
     }
 
     if let (true, Some(size)) = (opts.recover, pointer_size) {
-        eprintln!("attempting recovery via `git lfs smudge` for sha256:{}", oid.0);
+        eprintln!(
+            "attempting recovery via `git lfs smudge` for sha256:{}",
+            oid.0
+        );
         match recover_object(cache_path, oid, size).await {
             Ok(()) => {
                 eprintln!("recovery succeeded");

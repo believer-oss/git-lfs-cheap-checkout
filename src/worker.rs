@@ -33,7 +33,7 @@ pub(crate) async fn smudge_file(
     };
 
     if opts.verbose {
-        println!("{}: {:?}", &local_file, pointer);
+        println!("{}: {:?}", local_file, pointer);
     }
 
     let obj = path_from_oid(local_object_dir, &pointer.oid);

@@ -10,12 +10,12 @@ use crate::{hash::compute_sha256, pointer::Oid};
 // the smudged content on stdout (which we discard). Reuses git-lfs's
 // transfer/credential plumbing without depending on the current ref or any
 // path-to-OID mapping.
-pub(crate) async fn recover_object(
-    cache_path: &Path,
-    oid: &Oid,
-    size: u64,
-) -> Result<(), String> {
+pub(crate) async fn recover_object(cache_path: &Path, oid: &Oid, size: u64) -> Result<(), String> {
     if cache_path.exists() {
+        // Required on Windows so remove_file isn't blocked by
+        // FILE_ATTRIBUTE_READONLY. Unix deletes by directory write
+        // permission, so the dance is unnecessary there.
+        #[cfg(windows)]
         if let Ok(meta) = tokio::fs::metadata(cache_path).await {
             if meta.permissions().readonly() {
                 let mut perms = meta.permissions();
