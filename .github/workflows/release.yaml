@@ -9,17 +9,7 @@ on:
       - v[0-9]+.*
 
 jobs:
-  create-release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/create-gh-release-action@v1
-        with:
-          # (required) GitHub token for creating GitHub Releases.
-          token: ${{ secrets.GITHUB_TOKEN }}
-
   upload-assets:
-    needs: create-release
     strategy:
       matrix:
         include:
@@ -32,24 +22,37 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: taiki-e/upload-rust-binary-action@v1
+
+      - uses: believer-oss/setup-rust-toolchain@ff4c7a2d9523e22eab355f13c7732a4ea3e7a9b1
         with:
-          # (required) Comma-separated list of binary names (non-extension portion of filename) to build and upload.
-          # Note that glob pattern is not supported yet.
-          bin: git-lfs-cheap-checkout
-          # (optional) Target triple, default is host triple.
-          # This is optional but it is recommended that this always be set to
-          # clarify which target you are building for if macOS is included in
-          # the matrix because GitHub Actions changed the default architecture
-          # of macos-latest since macos-14.
           target: ${{ matrix.target }}
-          # (optional) On which platform to distribute the `.tar.gz` file.
-          # [default value: unix]
-          # [possible values: all, unix, windows, none]
-          tar: unix
-          # (optional) On which platform to distribute the `.zip` file.
-          # [default value: windows]
-          # [possible values: all, unix, windows, none]
-          zip: windows
-          # (required) GitHub token for uploading assets to GitHub Releases.
+
+      # x86_64-pc-windows-gnu needs the mingw-w64 linker, which lives here on
+      # GitHub's windows runners but isn't on PATH by default.
+      - name: Add mingw to PATH (windows-gnu)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        shell: bash
+        run: echo "C:/msys64/mingw64/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf "$GITHUB_WORKSPACE/git-lfs-cheap-checkout-${{ matrix.target }}.tar.gz" git-lfs-cheap-checkout
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: Compress-Archive -Path "target\${{ matrix.target }}\release\git-lfs-cheap-checkout.exe" -DestinationPath "git-lfs-cheap-checkout-${{ matrix.target }}.zip"
+
+      - name: Release
+        uses: believer-oss/action-gh-release@ab50eebb6488051c6788d97fa95232267c6a4e23
+        with:
+          files: |
+            git-lfs-cheap-checkout-${{ matrix.target }}.tar.gz
+            git-lfs-cheap-checkout-${{ matrix.target }}.zip
           token: ${{ secrets.GITHUB_TOKEN }}
