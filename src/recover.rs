@@ -2,7 +2,10 @@ use std::path::Path;
 
 use tokio::io::AsyncWriteExt;
 
-use crate::{hash::compute_sha256, pointer::Oid};
+use crate::{
+    hash::compute_sha256,
+    pointer::{Oid, LFS_POINTER_VERSION_LINE},
+};
 
 // Re-fetch a single corrupt LFS object via `git lfs smudge`. We construct a
 // pointer from the OID and size already known to the caller and pipe it to
@@ -31,8 +34,8 @@ pub(crate) async fn recover_object(cache_path: &Path, oid: &Oid, size: u64) -> R
     }
 
     let pointer = format!(
-        "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
-        oid.0, size
+        "{}\noid sha256:{}\nsize {}\n",
+        LFS_POINTER_VERSION_LINE, oid.0, size
     );
 
     let mut child = tokio::process::Command::new("git-lfs")
