@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, process::exit, sync::Arc};
 
 use crate::{
-    pointer::{parse_pointer, path_from_oid, Oid},
+    pointer::{check_pointer, path_from_oid, Oid, PointerCheck},
     usn::read_usn,
     verify::{verify_object, VerifyOutcome},
     Options,
@@ -15,21 +15,39 @@ pub(crate) async fn smudge_file(
     expected: Arc<HashMap<String, i64>>,
     opts: Options,
 ) -> Option<(String, i64)> {
-    let meta = tokio::fs::metadata(&local_file)
-        .await
-        .expect("failed to get metadata for pointer file");
+    // Missing in the worktree -- can happen if `git lfs ls-files` lists a path
+    // that wasn't checked out (sparse / partial checkout). Log and skip so one
+    // missing path can't panic the runtime via JoinError and abort the scan.
+    let meta = match tokio::fs::metadata(&local_file).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}: {}", local_file, e);
+            return None;
+        }
+    };
     // Pointer files must be < 1024. Larger means already smudged.
     if meta.len() > 1024 {
         return None;
     }
 
-    let contents = tokio::fs::read_to_string(&local_file).await;
-    let pointer = match contents {
-        Ok(c) => parse_pointer(&c).expect("failed to parse pointer"),
+    // A path with the `lfs` gitattribute isn't a guarantee that the on-disk
+    // content IS a pointer (pre-LFS-conversion files, incidentally-matched
+    // non-LFS content). check_pointer classifies into three outcomes so we
+    // can silent-skip non-pointers while still surfacing corrupt ones.
+    let bytes = match tokio::fs::read(&local_file).await {
+        Ok(b) => b,
         Err(e) => {
             eprintln!("{}: {}", local_file, e);
             return None;
         }
+    };
+    let pointer = match check_pointer(&bytes) {
+        PointerCheck::NotPointer => return None,
+        PointerCheck::Malformed(e) => {
+            eprintln!("{}: malformed pointer: {}", local_file, e);
+            return None;
+        }
+        PointerCheck::Valid(p) => p,
     };
 
     if opts.verbose {
