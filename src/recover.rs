@@ -8,11 +8,10 @@ use crate::{
 };
 
 // Re-fetch a single corrupt LFS object via `git lfs smudge`. We construct a
-// pointer from the OID and size already known to the caller and pipe it to
-// smudge's stdin; smudge populates the cache as a side effect of producing
-// the smudged content on stdout (which we discard). Reuses git-lfs's
-// transfer/credential plumbing without depending on the current ref or any
-// path-to-OID mapping.
+// pointer from the OID and size already known to the caller, pipe it to
+// smudge's stdin, capture the smudged content from stdout, and write it
+// into the cache ourselves. Reuses git-lfs's transfer/credential plumbing
+// without depending on the current ref or any path-to-OID mapping.
 pub(crate) async fn recover_object(cache_path: &Path, oid: &Oid, size: u64) -> Result<(), String> {
     if cache_path.exists() {
         // Required on Windows so remove_file isn't blocked by
@@ -41,7 +40,7 @@ pub(crate) async fn recover_object(cache_path: &Path, oid: &Oid, size: u64) -> R
     let mut child = tokio::process::Command::new("git-lfs")
         .arg("smudge")
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn git-lfs smudge: {}", e))?;
@@ -67,6 +66,18 @@ pub(crate) async fn recover_object(cache_path: &Path, oid: &Oid, size: u64) -> R
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+
+    // Cheap length sanity-check before paying the SHA-256 cost.
+    if (output.stdout.len() as u64) != size {
+        return Err(format!(
+            "smudge produced wrong size (expected {}, got {})",
+            size,
+            output.stdout.len()
+        ));
+    }
+    tokio::fs::write(cache_path, &output.stdout)
+        .await
+        .map_err(|e| format!("failed to write recovered cache object: {}", e))?;
 
     let hex = compute_sha256(cache_path)
         .await
