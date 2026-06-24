@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use tracing::{error, info};
+
 use crate::{
     hash::compute_sha256, pointer::Oid, recover::recover_object, usn::read_usn, Options,
     EXIT_INTEGRITY_FAILURE, EXIT_RECOVERY_FAILED,
@@ -25,22 +27,6 @@ async fn snapshot_state(path: &Path) -> ObjectState {
         modified: meta.as_ref().and_then(|m| m.modified().ok()),
         readonly: meta.as_ref().map(|m| m.permissions().readonly()),
         usn,
-    }
-}
-
-fn log_object_state(label: &str, path: &Path, state: &ObjectState) {
-    eprintln!("  {} path: {}", label, path.display());
-    if let Some(s) = state.size {
-        eprintln!("  {} size: {}", label, s);
-    }
-    if let Some(m) = state.modified {
-        eprintln!("  {} modified: {:?}", label, m);
-    }
-    if let Some(ro) = state.readonly {
-        eprintln!("  {} read-only: {}", label, ro);
-    }
-    if let Some(usn) = state.usn {
-        eprintln!("  {} usn: {}", label, usn);
     }
 }
 
@@ -127,31 +113,38 @@ async fn report_failure(
     pointer_size: Option<u64>,
     opts: Options,
 ) -> VerifyOutcome {
-    eprintln!("{}", reason);
-    if let Some(p) = working_path {
-        eprintln!("  working path: {}", p);
-    }
     let state = snapshot_state(cache_path).await;
-    log_object_state("cache", cache_path, &state);
-    eprintln!("  expected oid: sha256:{}", oid.0);
-    match compute_sha256(cache_path).await {
-        Ok(h) => eprintln!("  computed hash: sha256:{}", h),
-        Err(e) => eprintln!("  computed hash: <failed: {}>", e),
-    }
+    let computed_hash = compute_sha256(cache_path).await;
+    // One structured event collects everything the prior multi-line dump
+    // emitted. The `reason` field text is also formatted into the message
+    // body so substring assertions (e2e tests on "size mismatch", "hash
+    // mismatch", "USN drift", etc.) continue to match.
+    error!(
+        working_path = ?working_path,
+        cache_path = %cache_path.display(),
+        cache_size = ?state.size,
+        cache_modified = ?state.modified,
+        cache_readonly = ?state.readonly,
+        cache_usn = ?state.usn,
+        expected_oid = %oid.0,
+        computed_hash = ?computed_hash.as_ref().ok(),
+        "{}",
+        reason,
+    );
 
     if let (true, Some(size)) = (opts.recover, pointer_size) {
-        eprintln!(
+        info!(
             "attempting recovery via `git lfs smudge` for sha256:{}",
             oid.0
         );
         match recover_object(cache_path, oid, size).await {
             Ok(()) => {
-                eprintln!("recovery succeeded");
+                info!("recovery succeeded");
                 // Caller will re-read USN after any final modifications.
                 return VerifyOutcome::Continue(None);
             }
             Err(e) => {
-                eprintln!("recovery failed: {}", e);
+                error!("recovery failed: {}", e);
                 return VerifyOutcome::Fatal(EXIT_RECOVERY_FAILED);
             }
         }
@@ -188,8 +181,15 @@ pub(crate) async fn verify_object(
         match usn_with_hash_fallback(cache_path, oid, expected).await {
             UsnResult::Ok(usn) => current_usn = Some(usn),
             UsnResult::DriftHashOk(usn, reason) => {
-                eprintln!("{}", reason);
-                eprintln!("  content hash matches oid; refreshing manifest baseline");
+                // Drift is a real signal (something touched the cache file
+                // between runs) even though the content survived. Keep at
+                // info so the always-on pipeline run surfaces it; counts
+                // here should be low because USN bumps only fire on actual
+                // FS-level writes, not on simple reads.
+                info!(
+                    "{}; content hash matches oid; refreshing manifest baseline",
+                    reason
+                );
                 current_usn = Some(usn);
                 hash_already_verified = true;
             }

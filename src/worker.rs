@@ -1,82 +1,133 @@
-use std::{collections::HashMap, path::PathBuf, process::exit, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    process::exit,
+    sync::{atomic::Ordering, Arc},
+};
+
+use tracing::{debug, warn};
 
 use crate::{
     pointer::{check_pointer, path_from_oid, Oid, PointerCheck},
-    usn::read_usn,
+    usn::{read_usn, same_file_id},
     verify::{verify_object, VerifyOutcome},
-    Options,
+    Counters, Options,
 };
 
-// Smudge-mode worker. Returns Some((oid, new_usn)) if verify_usn ran and the
-// manifest should be updated; None otherwise.
+// Smudge-mode worker. Verifies the cache object for one tracked LFS file
+// (`local_file` from `git lfs ls-files`, `oid_from_index` from the same call's
+// `-l` output) and, when needed, links the worktree file at the cache object.
+// Returns Some((oid, new_usn)) if verify_usn ran and the manifest should be
+// updated; None otherwise.
 pub(crate) async fn smudge_file(
     local_file: String,
+    oid_from_index: Oid,
     local_object_dir: PathBuf,
     expected: Arc<HashMap<String, i64>>,
+    counters: Arc<Counters>,
     opts: Options,
 ) -> Option<(String, i64)> {
+    counters.processed.fetch_add(1, Ordering::Relaxed);
+
     // Missing in the worktree -- can happen if `git lfs ls-files` lists a path
     // that wasn't checked out (sparse / partial checkout). Log and skip so one
     // missing path can't panic the runtime via JoinError and abort the scan.
     let meta = match tokio::fs::metadata(&local_file).await {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("{}: {}", local_file, e);
+            warn!(file = %local_file, error = %e, "skipping (worktree metadata failed)");
             return None;
         }
     };
-    // Pointer files must be < 1024. Larger means already smudged.
-    if meta.len() > 1024 {
-        return None;
-    }
 
-    // A path with the `lfs` gitattribute isn't a guarantee that the on-disk
-    // content IS a pointer (pre-LFS-conversion files, incidentally-matched
-    // non-LFS content). check_pointer classifies into three outcomes so we
-    // can silent-skip non-pointers while still surfacing corrupt ones.
-    let bytes = match tokio::fs::read(&local_file).await {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("{}: {}", local_file, e);
-            return None;
+    let obj = path_from_oid(local_object_dir, &oid_from_index);
+
+    // Two worktree shapes both feed the same verify path:
+    //  - pointer-shaped (<=1024 bytes): parse the pointer for its size field
+    //  - already-smudged (>1024 bytes): trust the ls-files OID and use the
+    //    on-disk size as the verification target (when correctly hardlinked
+    //    this equals the cache file's size).
+    let pointer_size = if meta.len() <= 1024 {
+        let bytes = match tokio::fs::read(&local_file).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(file = %local_file, error = %e, "skipping (worktree read failed)");
+                return None;
+            }
+        };
+        match check_pointer(&bytes) {
+            PointerCheck::NotPointer => return None,
+            PointerCheck::Malformed(e) => {
+                warn!(file = %local_file, error = %e, "skipping (malformed pointer)");
+                return None;
+            }
+            PointerCheck::Valid(p) => {
+                // Defensive: ls-files (git tree) is the source of truth, but a
+                // worktree pointer that disagrees is anomalous enough to log.
+                if p.oid != oid_from_index {
+                    warn!(
+                        file = %local_file,
+                        pointer_oid = %p.oid.0,
+                        index_oid = %oid_from_index.0,
+                        "worktree pointer OID disagrees with ls-files; using ls-files OID",
+                    );
+                }
+                Some(p.size)
+            }
         }
-    };
-    let pointer = match check_pointer(&bytes) {
-        PointerCheck::NotPointer => return None,
-        PointerCheck::Malformed(e) => {
-            eprintln!("{}: malformed pointer: {}", local_file, e);
-            return None;
-        }
-        PointerCheck::Valid(p) => p,
+    } else {
+        Some(meta.len())
     };
 
-    if opts.verbose {
-        println!("{}: {:?}", local_file, pointer);
-    }
+    debug!(file = %local_file, oid = %oid_from_index.0, size = ?pointer_size, "smudge_file");
 
-    let obj = path_from_oid(local_object_dir, &pointer.oid);
-
-    match verify_object(
+    let outcome = verify_object(
         Some(&local_file),
         &obj,
-        Some(pointer.size),
-        &pointer.oid,
-        expected.get(&pointer.oid.0).copied(),
+        pointer_size,
+        &oid_from_index,
+        expected.get(&oid_from_index.0).copied(),
         opts,
     )
-    .await
-    {
-        VerifyOutcome::Continue(_) => {}
-        VerifyOutcome::Fatal(code) => exit(code),
-    }
+    .await;
+    let recovered = match outcome {
+        VerifyOutcome::Continue(None) if opts.recover => {
+            counters.recovered.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        VerifyOutcome::Continue(_) => false,
+        VerifyOutcome::Fatal(code) => {
+            counters.integrity_failures.fetch_add(1, Ordering::Relaxed);
+            exit(code);
+        }
+    };
 
-    if !opts.dry_run {
+    // Relink policy:
+    //   - recovered: cache file was deleted+recreated, so the prior worktree
+    //     hardlink (if any) now points at an orphaned MFT entry holding the
+    //     pre-recovery (damaged) bytes. Must relink.
+    //   - meta.len() <= 1024: worktree is a pointer file; smudging means
+    //     replacing it with a hardlink to the cache object.
+    //   - otherwise: worktree is already-smudged. Skip the relink iff the
+    //     worktree path already shares the cache object's MFT entry.
+    let need_relink = !opts.dry_run
+        && (recovered
+            || meta.len() <= 1024
+            || !same_file_id(local_file.as_ref(), &obj)
+                .await
+                .unwrap_or(false));
+    if need_relink {
         tokio::fs::remove_file(&local_file)
             .await
             .expect("failed to remove file");
         tokio::fs::hard_link(&obj, &local_file)
             .await
             .expect("failed to hard link");
+        counters.relinked.fetch_add(1, Ordering::Relaxed);
+    } else if !opts.dry_run {
+        counters
+            .skipped_already_linked
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     if opts.read_only && !opts.dry_run {
@@ -91,8 +142,14 @@ pub(crate) async fn smudge_file(
     }
 
     if opts.verify_usn && !opts.dry_run {
-        let usn = read_usn(&obj).await.expect("failed to re-read USN");
-        Some((pointer.oid.0, usn))
+        match read_usn(&obj).await {
+            Ok(usn) => Some((oid_from_index.0, usn)),
+            Err(e) => {
+                counters.usn_read_failed.fetch_add(1, Ordering::Relaxed);
+                warn!(file = %local_file, obj = %obj.display(), error = %e, "USN read failed");
+                None
+            }
+        }
     } else {
         None
     }
@@ -105,11 +162,11 @@ pub(crate) async fn audit_object(
     cache_path: PathBuf,
     oid: Oid,
     expected: Arc<HashMap<String, i64>>,
+    counters: Arc<Counters>,
     opts: Options,
 ) -> Option<(String, i64)> {
-    if opts.verbose {
-        println!("auditing {}", cache_path.display());
-    }
+    counters.processed.fetch_add(1, Ordering::Relaxed);
+    debug!(cache_path = %cache_path.display(), oid = %oid.0, "audit_object");
     match verify_object(
         None,
         &cache_path,
@@ -124,14 +181,24 @@ pub(crate) async fn audit_object(
             if opts.verify_usn {
                 let usn = match usn {
                     Some(u) => u,
-                    None => read_usn(&cache_path).await.ok()?,
+                    None => match read_usn(&cache_path).await {
+                        Ok(u) => u,
+                        Err(e) => {
+                            counters.usn_read_failed.fetch_add(1, Ordering::Relaxed);
+                            warn!(obj = %cache_path.display(), error = %e, "USN read failed (audit)");
+                            return None;
+                        }
+                    },
                 };
                 Some((oid.0, usn))
             } else {
                 None
             }
         }
-        VerifyOutcome::Fatal(code) => exit(code),
+        VerifyOutcome::Fatal(code) => {
+            counters.integrity_failures.fetch_add(1, Ordering::Relaxed);
+            exit(code);
+        }
     }
 }
 

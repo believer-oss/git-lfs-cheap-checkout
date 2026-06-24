@@ -48,3 +48,40 @@ pub(crate) async fn read_usn(_path: &Path) -> std::io::Result<i64> {
         "USN journal is only supported on Windows/NTFS",
     ))
 }
+
+// Two NTFS hardlinks to the same MFT entry share volume + file index.
+// Used to skip a redundant remove+hard_link when the worktree file is
+// already pointing at the cache object's MFT entry.
+#[cfg(windows)]
+pub(crate) async fn same_file_id(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    fn file_id(path: &Path) -> std::io::Result<(u32, u32, u32)> {
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        let handle = file.as_raw_handle();
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(handle as _, &mut info) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
+    }
+
+    let a = a.to_owned();
+    let b = b.to_owned();
+    tokio::task::spawn_blocking(move || Ok(file_id(&a)? == file_id(&b)?))
+        .await
+        .expect("file id task panicked")
+}
+
+#[cfg(not(windows))]
+pub(crate) async fn same_file_id(_a: &Path, _b: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
