@@ -85,3 +85,37 @@ pub(crate) async fn same_file_id(a: &Path, b: &Path) -> std::io::Result<bool> {
 pub(crate) async fn same_file_id(_a: &Path, _b: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn same_file_id_true_for_hardlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        tokio::fs::write(&a, b"content").await.unwrap();
+        tokio::fs::hard_link(&a, &b).await.unwrap();
+        assert!(same_file_id(&a, &b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn same_file_id_false_for_distinct_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        tokio::fs::write(&a, b"content").await.unwrap();
+        // Same bytes but written as a separate file, so different MFT entry.
+        tokio::fs::write(&b, b"content").await.unwrap();
+        assert!(!same_file_id(&a, &b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn same_file_id_errors_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("does_not_exist");
+        let b = tmp.path().join("also_does_not_exist");
+        assert!(same_file_id(&a, &b).await.is_err());
+    }
+}

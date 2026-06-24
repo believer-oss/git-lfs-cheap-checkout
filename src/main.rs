@@ -73,6 +73,26 @@ fn cli() -> Command {
         )
 }
 
+// Parse one line of `git lfs ls-files -l` output: "<64-hex-oid> <* or -> <path>".
+// `*` means the object is present in the local LFS cache and `-` that it isn't;
+// the flag is unused here (we verify the cache object directly), but we still
+// consume it so the path doesn't accidentally absorb it. Returns None for empty,
+// non-UTF-8, or malformed lines — caller logs and skips.
+fn parse_ls_files_line(bytes: &[u8]) -> Option<(Oid, String)> {
+    let line = std::str::from_utf8(bytes).ok()?;
+    let mut parts = line.splitn(3, ' ');
+    let oid_str = parts.next()?;
+    let _flag = parts.next()?;
+    let path = parts.next()?;
+    if oid_str.len() != 64 || !oid_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if path.is_empty() {
+        return None;
+    }
+    Some((Oid(oid_str.to_string()), path.to_string()))
+}
+
 // Subscriber routes to JSON when stderr isn't a TTY (argo pipelines, captured
 // logs); pretty otherwise (interactive runs). `-v` sets the default level to
 // debug; RUST_LOG overrides for scoped debugging
@@ -210,23 +230,13 @@ async fn main() {
             if line.is_empty() {
                 continue;
             }
-            let line = match std::str::from_utf8(line) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "skipping non-utf8 ls-files line");
+            let (oid_from_index, local_file) = match parse_ls_files_line(line) {
+                Some(parsed) => parsed,
+                None => {
+                    warn!(line = %String::from_utf8_lossy(line), "skipping unparseable ls-files line");
                     continue;
                 }
             };
-            let mut parts = line.splitn(3, ' ');
-            let (oid_str, path) = match (parts.next(), parts.next(), parts.next()) {
-                (Some(o), Some(_flag), Some(p)) if o.len() == 64 => (o, p),
-                _ => {
-                    warn!(line = %line, "skipping unparseable ls-files line");
-                    continue;
-                }
-            };
-            let oid_from_index = Oid(oid_str.to_string());
-            let local_file = path.to_string();
             let local_object_dir = object_dir.clone();
             let expected = expected.clone();
             let counters = counters.clone();
@@ -283,4 +293,82 @@ async fn main() {
         total_duration_ms = total_start.elapsed().as_millis() as u64,
         "done",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OID: &str = "0926726201de4dbfeb2c4565a64bb3ce54dac189c7cab192bd515caf50c556dc";
+
+    #[test]
+    fn parse_ls_files_line_object_present() {
+        let line = format!("{} * Content/Foo.uasset", OID);
+        let (oid, path) = parse_ls_files_line(line.as_bytes()).unwrap();
+        assert_eq!(oid.0, OID);
+        assert_eq!(path, "Content/Foo.uasset");
+    }
+
+    #[test]
+    fn parse_ls_files_line_object_missing() {
+        // git-lfs uses '-' when the object isn't in the local cache.
+        let line = format!("{} - Content/Foo.uasset", OID);
+        let (oid, path) = parse_ls_files_line(line.as_bytes()).unwrap();
+        assert_eq!(oid.0, OID);
+        assert_eq!(path, "Content/Foo.uasset");
+    }
+
+    #[test]
+    fn parse_ls_files_line_path_with_spaces() {
+        // splitn(3, ' ') keeps everything after the flag in the path field,
+        // so paths containing spaces survive parsing.
+        let line = format!("{} * Content/Some Folder/With Spaces.uasset", OID);
+        let (_, path) = parse_ls_files_line(line.as_bytes()).unwrap();
+        assert_eq!(path, "Content/Some Folder/With Spaces.uasset");
+    }
+
+    #[test]
+    fn parse_ls_files_line_rejects_short_oid() {
+        let line = "0926abcd * Content/Foo.uasset";
+        assert!(parse_ls_files_line(line.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parse_ls_files_line_rejects_non_hex_oid() {
+        // 64 chars but contains 'Z'.
+        let bad = "Z926726201de4dbfeb2c4565a64bb3ce54dac189c7cab192bd515caf50c556dc";
+        let line = format!("{} * Content/Foo.uasset", bad);
+        assert!(parse_ls_files_line(line.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parse_ls_files_line_rejects_missing_path() {
+        let line = format!("{} *", OID);
+        assert!(parse_ls_files_line(line.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parse_ls_files_line_rejects_missing_flag() {
+        let line = OID.to_string();
+        assert!(parse_ls_files_line(line.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parse_ls_files_line_rejects_empty() {
+        assert!(parse_ls_files_line(b"").is_none());
+    }
+
+    #[test]
+    fn parse_ls_files_line_rejects_non_utf8() {
+        // 0xFF / 0xFE are not valid UTF-8 start bytes.
+        let bytes = b"\xff\xfe garbage line";
+        assert!(parse_ls_files_line(bytes).is_none());
+    }
+
+    #[test]
+    fn parse_ls_files_line_rejects_empty_path_field() {
+        // splitn could give us a trailing space then empty string.
+        let line = format!("{} * ", OID);
+        assert!(parse_ls_files_line(line.as_bytes()).is_none());
+    }
 }
