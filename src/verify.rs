@@ -94,10 +94,16 @@ async fn usn_with_hash_fallback(cache_path: &Path, oid: &Oid, expected: Option<i
     }
 }
 
-// Outcome of verifying a cache object: Continue with the current USN (if
-// known) for manifest updates, or exit with the given code.
+// Outcome of verifying a cache object.
+//   Continue(Some(usn)) — checks passed, USN observed for manifest update
+//   Continue(None)      — checks passed, USN not observed (verify_usn off)
+//   Recovered           — verify failed but recovery rebuilt the cache; the
+//                         caller must relink (prior worktree hardlink is now
+//                         orphaned) and re-read the USN
+//   Fatal(code)         — exit immediately with the given code
 pub(crate) enum VerifyOutcome {
     Continue(Option<i64>),
+    Recovered,
     Fatal(i32),
 }
 
@@ -140,8 +146,10 @@ async fn report_failure(
         match recover_object(cache_path, oid, size).await {
             Ok(()) => {
                 info!("recovery succeeded");
-                // Caller will re-read USN after any final modifications.
-                return VerifyOutcome::Continue(None);
+                // Distinct from Continue(None) so the caller can tell "happy
+                // path with no USN observed" from "we actually rebuilt the
+                // cache file and you need to relink". Caller re-reads USN.
+                return VerifyOutcome::Recovered;
             }
             Err(e) => {
                 error!("recovery failed: {}", e);
@@ -208,4 +216,57 @@ pub(crate) async fn verify_object(
     }
 
     VerifyOutcome::Continue(current_usn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audit_opts_with_recover() -> Options {
+        Options {
+            verbose: false,
+            dry_run: false,
+            verify_size: false,
+            verify_hash: true,
+            verify_usn: false,
+            read_only: false,
+            verify_cache: true,
+            recover: true,
+        }
+    }
+
+    // Guards the invariant `audit_object` relies on for its `unreachable!`
+    // arm: when verify_object is called with pointer_size = None (audit
+    // mode), recovery must NOT fire even if --recover is set, because
+    // report_failure's recovery branch is gated on `Some(size)`. If a future
+    // refactor drops that gate, this test fails before production does.
+    #[tokio::test]
+    async fn audit_mode_never_returns_recovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_path = tmp.path().join("audit_object");
+        tokio::fs::write(&cache_path, b"not the content the oid claims")
+            .await
+            .unwrap();
+        // OID that cannot match SHA-256 of the bytes above.
+        let oid =
+            Oid("0000000000000000000000000000000000000000000000000000000000000000".to_string());
+
+        let outcome = verify_object(
+            None, // working_path: audit has none
+            &cache_path,
+            None, // pointer_size: audit has none
+            &oid,
+            None, // expected USN: not set
+            audit_opts_with_recover(),
+        )
+        .await;
+
+        match outcome {
+            VerifyOutcome::Fatal(code) => assert_eq!(code, EXIT_INTEGRITY_FAILURE),
+            VerifyOutcome::Recovered => {
+                panic!("recovery fired in audit mode; audit_object's unreachable! would panic")
+            }
+            VerifyOutcome::Continue(_) => panic!("hash mismatch should have failed"),
+        }
+    }
 }
