@@ -42,12 +42,28 @@ pub(crate) async fn smudge_file(
 
     let obj = path_from_oid(local_object_dir, &oid_from_index);
 
-    // Two worktree shapes both feed the same verify path:
-    //  - pointer-shaped (<=1024 bytes): parse the pointer for its size field
-    //  - already-smudged (>1024 bytes): trust the ls-files OID and use the
-    //    on-disk size as the verification target (when correctly hardlinked
-    //    this equals the cache file's size).
-    let pointer_size = if meta.len() <= 1024 {
+    // Compute hardlink state up front and reuse it for both the verify-path
+    // dispatch and the relink decision below. `same_file_id` failure (cache
+    // path missing on first run, etc.) is treated as "not linked" so the size
+    // branch handles those cases normally.
+    let already_linked = same_file_id(local_file.as_ref(), &obj)
+        .await
+        .unwrap_or(false);
+
+    // Three worktree shapes feed the same verify path:
+    //  - already-hardlinked to the cache object (any size): trust ls-files
+    //    OID, use the on-disk size. This branch is what saves a small smudged
+    //    LFS file from being misclassified by `check_pointer` as NotPointer
+    //    on the binary content of an already-linked cache object.
+    //  - pointer-shaped, not yet linked (<=1024 bytes): parse the pointer for
+    //    its size field.
+    //  - already-smudged, not yet linked (>1024 bytes): trust the ls-files
+    //    OID and use the on-disk size as the verification target. This covers
+    //    the case where someone (or `git lfs checkout`) materialized the
+    //    content before cheap-checkout ran.
+    let pointer_size = if already_linked {
+        Some(meta.len())
+    } else if meta.len() <= 1024 {
         let bytes = match tokio::fs::read(&local_file).await {
             Ok(b) => b,
             Err(e) => {
@@ -91,7 +107,7 @@ pub(crate) async fn smudge_file(
     )
     .await;
     let recovered = match outcome {
-        VerifyOutcome::Continue(None) if opts.recover => {
+        VerifyOutcome::Recovered => {
             counters.recovered.fetch_add(1, Ordering::Relaxed);
             true
         }
@@ -103,19 +119,13 @@ pub(crate) async fn smudge_file(
     };
 
     // Relink policy:
-    //   - recovered: cache file was deleted+recreated, so the prior worktree
-    //     hardlink (if any) now points at an orphaned MFT entry holding the
-    //     pre-recovery (damaged) bytes. Must relink.
-    //   - meta.len() <= 1024: worktree is a pointer file; smudging means
-    //     replacing it with a hardlink to the cache object.
-    //   - otherwise: worktree is already-smudged. Skip the relink iff the
-    //     worktree path already shares the cache object's MFT entry.
-    let need_relink = !opts.dry_run
-        && (recovered
-            || meta.len() <= 1024
-            || !same_file_id(local_file.as_ref(), &obj)
-                .await
-                .unwrap_or(false));
+    //   - recovered: cache file was deleted+recreated by recover_object, so the
+    //     prior worktree hardlink (if any) now points at an orphaned MFT entry
+    //     holding the pre-recovery (damaged) bytes. Must relink.
+    //   - !already_linked: worktree path doesn't share the cache object's MFT
+    //     entry yet (pointer-shaped or smudged-but-not-linked). Link it.
+    //   - otherwise: already-linked. Skip the redundant remove+hard_link.
+    let need_relink = !opts.dry_run && (recovered || !already_linked);
     if need_relink {
         tokio::fs::remove_file(&local_file)
             .await
@@ -195,6 +205,10 @@ pub(crate) async fn audit_object(
                 None
             }
         }
+        // Audit mode passes pointer_size = None into verify_object, which
+        // gates the recovery branch in report_failure. Recovery is the
+        // pipeline's job at this altitude.
+        VerifyOutcome::Recovered => unreachable!("audit mode never recovers"),
         VerifyOutcome::Fatal(code) => {
             counters.integrity_failures.fetch_add(1, Ordering::Relaxed);
             exit(code);

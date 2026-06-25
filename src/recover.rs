@@ -37,8 +37,13 @@ pub(crate) async fn recover_object(cache_path: &Path, oid: &Oid, size: u64) -> R
         LFS_POINTER_VERSION_LINE, oid.0, size
     );
 
+    // Recovery depends on smudge actually fetching content. Override any
+    // inherited GIT_LFS_SKIP_SMUDGE=1 in the environment — with that set,
+    // `git lfs smudge` becomes a stdin→stdout pass-through and emits the
+    // pointer text instead of the smudged bytes.
     let mut child = tokio::process::Command::new("git-lfs")
         .arg("smudge")
+        .env("GIT_LFS_SKIP_SMUDGE", "0")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
