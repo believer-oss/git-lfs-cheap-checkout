@@ -1,6 +1,7 @@
 [package]
 name = "git-lfs-cheap-checkout"
-version = "0.1.4"
+# Placeholder — .github/workflows/release.yaml rewrites this to the pushed tag.
+version = "0.0.1"
 edition = "2021"
 
 [dependencies]
