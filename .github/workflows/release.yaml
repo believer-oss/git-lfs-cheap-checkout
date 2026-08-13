@@ -34,6 +34,37 @@ jobs:
         shell: bash
         run: echo "C:/msys64/mingw64/bin" >> "$GITHUB_PATH"
 
+      # Gate the release on tests passing for the target we're about to ship.
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      # Cargo.toml's [package] version is a placeholder; the shipped binary's
+      # CARGO_PKG_VERSION comes from the pushed tag. Local mutation only —
+      # never committed back.
+      - name: Sync Cargo.toml version to tag
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python <<'PY'
+          import os, re, sys
+          v = os.environ["TAG"].lstrip("v")
+          with open("Cargo.toml") as f:
+              content = f.read()
+          updated, n = re.subn(
+              r'^version = "[^"]*"',
+              f'version = "{v}"',
+              content,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if n == 0:
+              sys.exit("no [package] version line found in Cargo.toml")
+          with open("Cargo.toml", "w") as f:
+              f.write(updated)
+          print(f"Cargo.toml version -> {v}")
+          PY
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
