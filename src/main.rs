@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     process::exit,
     sync::{
@@ -79,7 +79,9 @@ fn cli() -> Command {
 // consume it so the path doesn't accidentally absorb it. Returns None for empty,
 // non-UTF-8, or malformed lines — caller logs and skips.
 fn parse_ls_files_line(bytes: &[u8]) -> Option<(Oid, String)> {
-    let line = std::str::from_utf8(bytes).ok()?;
+    // Trim any trailing \r so CRLF-terminated output (git-for-windows in some
+    // configurations) parses cleanly rather than leaving a \r on the path.
+    let line = std::str::from_utf8(bytes).ok()?.trim_end_matches('\r');
     let mut parts = line.splitn(3, ' ');
     let oid_str = parts.next()?;
     let _flag = parts.next()?;
@@ -90,7 +92,10 @@ fn parse_ls_files_line(bytes: &[u8]) -> Option<(Oid, String)> {
     if path.is_empty() {
         return None;
     }
-    Some((Oid(oid_str.to_string()), path.to_string()))
+    // Normalize to lowercase — compute_sha256 emits lowercase, and any OID we
+    // compare against must match that convention or every hash check fails as
+    // a spurious "hash mismatch".
+    Some((Oid(oid_str.to_ascii_lowercase()), path.to_string()))
 }
 
 // Subscriber routes to JSON when stderr isn't a TTY (argo pipelines, captured
@@ -156,18 +161,26 @@ async fn main() {
     // ex. <object_dir>/ff/01/ff01f714b73af49cfa2a5837e08f36559a8b1af37928351f7e750204d632bfc0
     let mut object_dir = PathBuf::new();
     for line in env.stdout.split(|&c| c == b'\n') {
-        let line = std::str::from_utf8(line).expect("could not convert to utf8 from env");
+        // trim_end_matches for CRLF toolchains; split_once('=') so paths that
+        // themselves contain '=' survive (rare, but legal in a filesystem path).
+        let line = std::str::from_utf8(line)
+            .expect("could not convert to utf8 from env")
+            .trim_end_matches('\r');
         // Workdir is the root of the git repo
         if line.starts_with("LocalWorkingDir") {
             let workdir = line
-                .split("=")
-                .nth(1)
+                .split_once('=')
+                .map(|(_, v)| v)
                 .expect("could not extract value from env");
             std::env::set_current_dir(workdir).expect("failed to set workdir");
         }
         // Mediadir is the LFS storage dir
         if line.starts_with("LocalMediaDir") {
-            object_dir.push(line.split("=").nth(1).expect("failed to get object dir"));
+            object_dir.push(
+                line.split_once('=')
+                    .map(|(_, v)| v)
+                    .expect("failed to get object dir"),
+            );
         }
     }
 
@@ -194,6 +207,11 @@ async fn main() {
 
     let counters: Arc<Counters> = Arc::new(Counters::default());
     let work_start = Instant::now();
+
+    // Track OIDs currently in the tree so smudge-mode can prune manifest
+    // entries for OIDs that no longer exist. Left empty in audit mode; the
+    // prune pass is gated on `!opts.verify_cache` below.
+    let mut ls_files_oids: HashSet<String> = HashSet::new();
 
     // Dispatch: audit walks the cache, otherwise we smudge each tracked file
     let mut handles = tokio::task::JoinSet::new();
@@ -237,6 +255,7 @@ async fn main() {
                     continue;
                 }
             };
+            ls_files_oids.insert(oid_from_index.0.clone());
             let local_object_dir = object_dir.clone();
             let expected = expected.clone();
             let counters = counters.clone();
@@ -265,6 +284,18 @@ async fn main() {
     while let Some(result) = handles.join_next().await {
         if let Some((oid, usn)) = result.expect("worker task panicked") {
             new_manifest.insert(oid, usn);
+        }
+    }
+
+    // Smudge-mode: drop manifest entries for OIDs no longer in the tree.
+    // Audit mode has no ground truth for "in the tree" so its manifest is
+    // left additive.
+    if !opts.verify_cache {
+        let before = new_manifest.len();
+        new_manifest.retain(|oid, _| ls_files_oids.contains(oid));
+        let pruned = before.saturating_sub(new_manifest.len());
+        if pruned > 0 {
+            info!(pruned, "pruned manifest entries no longer in tree");
         }
     }
 
@@ -370,5 +401,24 @@ mod tests {
         // splitn could give us a trailing space then empty string.
         let line = format!("{} * ", OID);
         assert!(parse_ls_files_line(line.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parse_ls_files_line_normalizes_uppercase_oid() {
+        // Uppercase-hex input parses fine, but must be stored lowercase so
+        // downstream string equality against compute_sha256's output matches.
+        let upper = OID.to_ascii_uppercase();
+        let line = format!("{} * Content/Foo.uasset", upper);
+        let (oid, _) = parse_ls_files_line(line.as_bytes()).unwrap();
+        assert_eq!(oid.0, OID);
+    }
+
+    #[test]
+    fn parse_ls_files_line_strips_trailing_cr() {
+        // CRLF-terminated stdout (some git-for-windows configs) shouldn't
+        // leave a \r on the path field.
+        let line = format!("{} * Content/Foo.uasset\r", OID);
+        let (_, path) = parse_ls_files_line(line.as_bytes()).unwrap();
+        assert_eq!(path, "Content/Foo.uasset");
     }
 }
