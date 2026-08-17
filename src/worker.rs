@@ -8,6 +8,7 @@ use std::{
 use tracing::{debug, warn};
 
 use crate::{
+    hash::sha256_bytes,
     pointer::{check_pointer, path_from_oid, Oid, PointerCheck},
     usn::{read_usn, same_file_id},
     verify::{verify_object, VerifyOutcome},
@@ -72,7 +73,26 @@ pub(crate) async fn smudge_file(
             }
         };
         match check_pointer(&bytes) {
-            PointerCheck::NotPointer => return None,
+            PointerCheck::NotPointer => {
+                // A small (<=1024) worktree file that isn't pointer-shaped and
+                // isn't hardlinked to the cache could still be a valid
+                // byte-copy materialization (e.g. from `git lfs checkout`,
+                // which copies rather than hardlinks). Hash the bytes we
+                // already have; if the digest matches the ls-files OID,
+                // treat it as an already-smudged file and let the verify
+                // path relink it to the cache.
+                let hex = sha256_bytes(&bytes);
+                if hex == oid_from_index.0 {
+                    debug!(
+                        file = %local_file,
+                        oid = %oid_from_index.0,
+                        "small file copy-materialized; relinking to cache",
+                    );
+                    Some(meta.len())
+                } else {
+                    return None;
+                }
+            }
             PointerCheck::Malformed(e) => {
                 warn!(file = %local_file, error = %e, "skipping (malformed pointer)");
                 return None;
@@ -127,6 +147,20 @@ pub(crate) async fn smudge_file(
     //   - otherwise: already-linked. Skip the redundant remove+hard_link.
     let need_relink = !opts.dry_run && (recovered || !already_linked);
     if need_relink {
+        // Symmetric to recover.rs:20-29: on Windows, remove_file is blocked
+        // by FILE_ATTRIBUTE_READONLY. This edge case fires when the cache
+        // object was missing (so recover.rs skipped its clear) but the
+        // worktree file is a stale RO hardlink from a prior --read_only run.
+        #[cfg(windows)]
+        if let Ok(meta) = tokio::fs::metadata(&local_file).await {
+            if meta.permissions().readonly() {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                tokio::fs::set_permissions(&local_file, perms)
+                    .await
+                    .expect("failed to clear read-only on worktree file");
+            }
+        }
         tokio::fs::remove_file(&local_file)
             .await
             .expect("failed to remove file");

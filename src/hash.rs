@@ -18,6 +18,14 @@ pub(crate) async fn compute_sha256(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+// In-memory SHA-256 for bytes we've already read (small-file paths where
+// we don't want to re-open + re-read from disk).
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -48,7 +48,10 @@ impl From<&str> for Oid {
 
 pub(crate) fn parse_pointer(contents: &str) -> Result<GitLfsPointer, ParseError> {
     let mut oid: Option<Oid> = None;
-    let mut size = 0;
+    let mut size: u64 = 0;
+    // Track presence separately from value — `size 0` is a legal pointer
+    // for an empty LFS-tracked file.
+    let mut size_seen = false;
     let mut version_ok = false;
 
     for line in contents.lines() {
@@ -70,13 +73,14 @@ pub(crate) fn parse_pointer(contents: &str) -> Result<GitLfsPointer, ParseError>
                 .ok_or(ParseError("size not found".to_string()))?
                 .parse()
                 .map_err(|_| ParseError("size not parsed".to_string()))?;
+            size_seen = true;
         }
     }
 
     if !version_ok {
         return Err(ParseError("version not found".to_string()));
     }
-    if size == 0 {
+    if !size_seen {
         return Err(ParseError("size not found".to_string()));
     }
     match oid {
@@ -165,6 +169,21 @@ mod tests {
             let i = parse_pointer(content);
             assert!(i.is_err());
         }
+    }
+
+    #[test]
+    fn parse_size_zero() {
+        // Empty LFS-tracked files have a legitimate `size 0` pointer.
+        let contents = "version https://git-lfs.github.com/spec/v1\n\
+            oid sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n\
+            size 0\n\
+        ";
+        let p = parse_pointer(contents).expect("size 0 should be a valid pointer");
+        assert_eq!(p.size, 0);
+        assert_eq!(
+            p.oid.0,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
